@@ -1,0 +1,15 @@
+# Compiled binaries
+manager
+peer
+
+# Object files and common build outputs
+*.o
+*.out
+a.out
+
+# macOS clutter
+.DS_Store
+*.dSYM/
+
+# Logs
+*.log
