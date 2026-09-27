@@ -66,7 +66,7 @@ int main(int argc, char *argv[])
         inet_ntop(AF_INET, &peerAddr.sin_addr, ip, sizeof(ip));
         printf("Manager: Recieved %i bytes from %s:%i type= %i\n", bytesReceived, ip, ntohs(peerAddr.sin_port), msg.type);
 
-        // Dispatch (stubs for now)
+        // Dispatch
         switch (msg.type)
         {
         case MSG_REGISTER:
