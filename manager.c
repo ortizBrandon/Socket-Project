@@ -8,9 +8,9 @@
 #include <arpa/inet.h>
 #include "protocol.h"
 
-#define FREE 0
-#define LEADER 1
-#define inDHT 2
+int dht_exists = 0;                 // 0 does not exist, 1 does exist
+int dht_built = 0;                  // 1 after it is built
+char dht_Leader[MAX_NAME_LEN] = ""; // intialize empty leader string
 
 // struct for the peer state storage
 typedef struct
@@ -25,7 +25,10 @@ typedef struct
 Peer peers[MAX_PEERS]; // we can hold up to a max num of peers (100)
 int numPeers = 0;      // as of the beginning we have 0 peers
 
+// prototypes
 static void registerPeer(Message *msg, struct sockaddr_in *peerAddress, socklen_t peerLength, int socketName);
+static void setupDht(Message *msg, struct sockaddr_in *peerAddress, socklen_t peerLength, int socketName);
+static void dhtComplete(Message *msg, struct sockaddr_in *peerAddress, socklen_t peerLength, int socketName);
 
 // command line input, taking a string input as the second argument
 int main(int argc, char *argv[])
@@ -76,7 +79,7 @@ int main(int argc, char *argv[])
         if (bytesReceived < 0)
         {
             perror("recvfrom");
-            return 1;
+            continue;
         }
 
         // track who sent the message
@@ -91,10 +94,10 @@ int main(int argc, char *argv[])
             registerPeer(&msg, &peerAddr, peerlen, managerSocket);
             break;
         case MSG_SETUP_DHT:
-            printf("Manager:   SETUP-DHT n=%i year=%i\n", msg.n, msg.year);
+            setupDht(&msg, &peerAddr, peerlen, managerSocket);
             break;
         case MSG_DHT_COMPLETE:
-            printf("Manager:   DHT-COMPLETE name=%s\n", msg.peer_name);
+            dhtComplete(&msg, &peerAddr, peerlen, managerSocket);
             break;
         default:
             printf("Manager:   unknown type %i\n", msg.type);
@@ -188,4 +191,128 @@ static void registerPeer(Message *msg, struct sockaddr_in *peerAddress, socklen_
     reply.return_code = RC_SUCCESS;
     sendto(socketName, &reply, sizeof(reply), 0,
            (struct sockaddr *)peerAddress, peerLength);
+}
+
+// setup-dht
+static void setupDht(Message *msg, struct sockaddr_in *peerAddress, socklen_t peerLength, int socketName)
+{
+    Message reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.type = MSG_SETUP_DHT;
+
+    // check that sender is registered (linear search)
+    int leaderIndex = -1;
+    for (int i = 0; i < numPeers; i++)
+    {
+        if (strcmp(peers[i].name, msg->peer_name) == 0)
+        {
+            leaderIndex = i; // peer found at index i
+            break;
+        }
+    }
+    if (leaderIndex < 0)
+    {
+        printf("Manager: setup-dht FAILED, sender NOT REGISTERED\n");
+        reply.return_code = RC_FAILURE;
+        sendto(socketName, &reply, sizeof(reply), 0, (struct sockaddr *)peerAddress, peerLength);
+        return;
+    }
+
+    // check that n>=3
+    if (msg->n < 3)
+    {
+        printf("Manager: setup-dht FAILED, ring size %i\n", msg->n);
+        reply.return_code = RC_FAILURE;
+        sendto(socketName, &reply, sizeof(reply), 0, (struct sockaddr *)peerAddress, peerLength);
+        return;
+    }
+
+    // check if dht already exists
+    if (dht_exists)
+    {
+        printf("Manager: setup-dht FAILED, a DHT already exists\n");
+        reply.return_code = RC_FAILURE;
+        sendto(socketName, &reply, sizeof(reply), 0,
+               (struct sockaddr *)peerAddress, peerLength);
+        return;
+    }
+
+    // check that at least n peers are registerd
+    if (numPeers < msg->n)
+    {
+        printf("Manager: setup-dht FAILED, only %d peers registered, need %d\n", numPeers, msg->n);
+        reply.return_code = RC_FAILURE;
+        sendto(socketName, &reply, sizeof(reply), 0,
+               (struct sockaddr *)peerAddress, peerLength);
+        return;
+    }
+
+    // build ring, leader first
+    peers[leaderIndex].state = STATE_LEADER;
+
+    strncpy(reply.tuples[0].peer_name, peers[leaderIndex].name, MAX_NAME_LEN - 1);
+    reply.tuples[0].peer_name[MAX_NAME_LEN - 1] = '\0';
+    strncpy(reply.tuples[0].ip, peers[leaderIndex].ip, INET_ADDRSTRLEN - 1);
+    reply.tuples[0].ip[INET_ADDRSTRLEN - 1] = '\0';
+    reply.tuples[0].p_port = peers[leaderIndex].p_port;
+
+    int count = 1;
+    for (int i = 0; i < numPeers && count < msg->n; i++)
+    {
+        if (i == leaderIndex)
+            continue; // skip leader
+        if (peers[i].state != STATE_FREE)
+            continue; // only Free peers
+
+        peers[i].state = STATE_INDHT;
+
+        strncpy(reply.tuples[count].peer_name, peers[i].name, MAX_NAME_LEN - 1);
+        reply.tuples[count].peer_name[MAX_NAME_LEN - 1] = '\0';
+        strncpy(reply.tuples[count].ip, peers[i].ip, INET_ADDRSTRLEN - 1);
+        reply.tuples[count].ip[INET_ADDRSTRLEN - 1] = '\0';
+        reply.tuples[count].p_port = peers[i].p_port;
+        count++;
+    }
+
+    // record dht state
+    dht_exists = 1;
+    dht_built = 0; // not built until dht-complete
+    strncpy(dht_Leader, peers[leaderIndex].name, MAX_NAME_LEN - 1);
+    dht_Leader[MAX_NAME_LEN - 1] = '\0';
+
+    // log and reply
+    //  --- 7. Log and reply SUCCESS ---
+    printf("Manager: setup-dht SUCCESS, n=%i year=%i leader='%s'\n",
+           msg->n, msg->year, dht_Leader);
+    for (int k = 0; k < count; k++)
+    {
+        printf("Manager:   tuple[%i] = %s %s:%i\n", k, reply.tuples[k].peer_name, reply.tuples[k].ip, reply.tuples[k].p_port);
+    }
+
+    reply.tuple_count = count;
+    reply.return_code = RC_SUCCESS;
+    sendto(socketName, &reply, sizeof(reply), 0, (struct sockaddr *)peerAddress, peerLength);
+}
+
+static void dhtComplete(Message *msg, struct sockaddr_in *peerAddress, socklen_t peerLength, int socketName)
+{
+    Message reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.type = MSG_DHT_COMPLETE;
+
+    // Sender must be the current leader
+    if (!dht_exists || strcmp(dht_Leader, msg->peer_name) != 0)
+    {
+        printf("Manager: dht-complete FAILED, '%s' is not the leader\n", msg->peer_name);
+        reply.return_code = RC_FAILURE;
+        sendto(socketName, &reply, sizeof(reply), 0, (struct sockaddr *)peerAddress, peerLength);
+        return;
+    }
+
+    dht_built = 1;
+
+    printf("Manager: dht-complete SUCCESS from leader '%s'\n", msg->peer_name);
+
+    reply.return_code = RC_SUCCESS;
+    sendto(socketName, &reply, sizeof(reply), 0, (struct sockaddr *)peerAddress, peerLength);
 }
