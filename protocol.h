@@ -24,6 +24,14 @@
 #define STATE_LEADER 1
 #define STATE_INDHT 2
 
+// add another struct (tuple) needed for setup-dht
+typedef struct
+{
+    char peer_name[MAX_NAME_LEN];
+    char ip[INET_ADDRSTRLEN];
+    int p_port;
+} Tuple;
+
 // ---- The wire format shared by both programs ----
 // One struct, fixed size, easy to send/recv as raw bytes.
 // Both programs must agree on this layout.
@@ -43,6 +51,9 @@ typedef struct
 
     // Return code used in replies from the manager
     int return_code; // RC_SUCCESS / RC_FAILURE
+
+    int tuple_count;
+    Tuple tuples[MAX_PEERS];
 
 } Message;
 
