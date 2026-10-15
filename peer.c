@@ -17,7 +17,7 @@
 
 // local hash table
 #define MAX_TABLE 200000
-static int myTable[MAX_TABLE];
+static char *myTable[MAX_TABLE]; // pointers to allocate what is needed
 static int myTableSize = 0;
 static int myCount = 0;
 
@@ -47,9 +47,9 @@ typedef struct
     int type;
     int peerID;
     int dhtSize;
-    int tableSize; // for SET_ID so peers know s
-    int pos;       // for STORE
-    int eventID;   // for STORE
+    int tableSize;      // for SET_ID so peers know s
+    int pos;            // for STORE
+    EventRecord record; // complete record for STORE
     int tupleCount;
     Tuple tuples[MAX_PEERS]; // for SET_ID
     int counts[MAX_PEERS];   // for DONE
@@ -422,7 +422,17 @@ static void handle_store(PeerMessage *m)
     {
         if (m->pos >= 0 && m->pos < myTableSize)
         {
-            myTable[m->pos] = m->eventID;
+            // only store if current slot is empty
+            if (myTable[m->pos] == NULL)
+            {
+                myTable[m->pos] = strdup(m->record.csvLine);
+
+                if (myTable[m->pos] == NULL)
+                {
+                    perror("strdup");
+                    return;
+                }
+            }
             myCount++;
         }
     }
@@ -534,10 +544,14 @@ static void populate_dht(int year, int n)
 
     while (fgets(line, sizeof(line), f))
     {
-        char *c = strchr(line, ',');
-        if (!c)
+        // if trailing newline, remove
+        line[strcspn(line, "\r\n")] = '\0';
+
+        // extract eventID from first csv field
+        char *comma = strchr(line, ',');
+        if (comma == NULL)
             continue;
-        *c = '\0';
+
         int event_id = atoi(line);
 
         int pos = event_id % myTableSize;
@@ -545,9 +559,19 @@ static void populate_dht(int year, int n)
 
         if (id == peerID)
         {
-            myTable[pos] = event_id;
-            myCount++;
-            local++;
+            if (myTable[pos] == NULL)
+            {
+                myTable[pos] = strdup(line);
+
+                if (myTable[pos] == NULL)
+                {
+                    perror("strdup");
+                    continue;
+                }
+
+                myCount++;
+                local++;
+            }
         }
         else
         {
@@ -555,7 +579,10 @@ static void populate_dht(int year, int n)
             memset(&pm, 0, sizeof(pm));
             pm.type = P2P_STORE;
             pm.pos = pos;
-            pm.eventID = event_id;
+            pm.record.eventID = event_id;
+
+            strncpy(pm.record.csvLine, line, sizeof(pm.record.csvLine) - 1);
+
             send_to_peer(&rightNeighbor, &pm);
             sent++;
         }

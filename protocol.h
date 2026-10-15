@@ -8,7 +8,8 @@
 #define MAX_PEERS 100
 #define MAX_NAME_LEN 16 // spec: peer-name is at most 15 chars + null
 #define MAX_BUFFER 4096
-#define MAX_EVENTS 10000 // upper bound for the local hash table
+#define MAX_EVENTS 10000    // upper bound for the local hash table
+#define MAX_RECORD_LEN 4096 //
 
 // ---- Message type codes ----
 #define MSG_REGISTER 1
@@ -31,6 +32,13 @@ typedef struct
     char ip[INET_ADDRSTRLEN];
     int p_port;
 } Tuple;
+
+// struct for storing entire event records
+typedef struct
+{
+    int eventID;
+    char csvLine[MAX_RECORD_LEN];
+} EventRecord;
 
 // ---- The wire format shared by both programs ----
 // One struct, fixed size, easy to send/recv as raw bytes.
