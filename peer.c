@@ -14,12 +14,15 @@
 #define P2P_SET_ID 1
 #define P2P_STORE 2
 #define P2P_DONE 3
+#define P2P_FIND_EVENT 4
+#define P2P_FIND_RESULT 5
 
 // local hash table
 #define MAX_TABLE 200000
 static char *myTable[MAX_TABLE]; // pointers to allocate what is needed
 static int myTableSize = 0;
 static int myCount = 0;
+static int myTableEventIDs[MAX_TABLE];
 
 // global state
 static char peerName[MAX_NAME_LEN] = "";
@@ -54,6 +57,13 @@ typedef struct
     Tuple tuples[MAX_PEERS]; // for SET_ID
     int counts[MAX_PEERS];   // for DONE
     int doneCount;
+
+    int eventID;            // event ID being searched for
+    int visited[MAX_PEERS]; // rracks visited DHT peer IDs
+    int visitedCount;       // num of peers already visited
+    int found;              // 1 if event was found, else 0
+    char requesterIP[INET_ADDRSTRLEN];
+    int requesterPort;
 } PeerMessage;
 
 // Prototypes
@@ -71,11 +81,15 @@ static int count_csv_lines(int year);
 static void populate_dht(int year, int n);
 static void send_dht_complete(void);
 static void print_config(void);
-static int store_with_linear_probing(int startPos, const char *csvLine);
+static int store_with_linear_probing(int startPos, int eventID, const char *csvLine);
 static void cmd_query_dht(const char *line);
-
+static void handle_find_event(PeerMessage *pm);
+static int find_event_local(int eventID, char *result, size_t resultSize);
 static int get_event_id_from_csv(const char *line);
 static void cmd_find_local_event(int eventID);
+static void send_find_result(PeerMessage *pm);
+static void handle_find_result(PeerMessage *pm);
+static void cmd_find_event(int eventID);
 
 int main(int argc, char *argv[])
 {
@@ -149,10 +163,6 @@ int main(int argc, char *argv[])
             {
                 cmd_query_dht(command);
             }
-            else if (strcmp(command, "config") == 0)
-            {
-                print_config();
-            }
             else if (strncmp(command, "find-local ", 11) == 0)
             {
                 int eventID;
@@ -165,6 +175,24 @@ int main(int argc, char *argv[])
                 {
                     printf("Usage: find-local <EVENT_ID>\n");
                 }
+            }
+            else if (strncmp(command, "find-event ", 11) == 0)
+            {
+                int eventID;
+                char extra;
+
+                if (sscanf(command + 11, "%d %c", &eventID, &extra) == 1)
+                {
+                    cmd_find_event(eventID);
+                }
+                else
+                {
+                    printf("Usage: find-event <EVENT_ID>\n");
+                }
+            }
+            else if (strcmp(command, "config") == 0)
+            {
+                print_config();
             }
             else if (strcmp(command, "quit") == 0)
             {
@@ -201,6 +229,12 @@ int main(int argc, char *argv[])
                 break;
             case P2P_DONE:
                 handle_done(&pm);
+                break;
+            case P2P_FIND_EVENT:
+                handle_find_event(&pm);
+                break;
+            case P2P_FIND_RESULT:
+                handle_find_result(&pm);
                 break;
             default:
                 printf("Unknown P2P type %d\n", pm.type);
@@ -436,7 +470,7 @@ static void handle_set_id(PeerMessage *m)
            peerID, dhtSize, rightNeighbor.peer_name);
 }
 
-static int store_with_linear_probing(int startPos, const char *csvLine)
+static int store_with_linear_probing(int startPos, int eventID, const char *csvLine)
 {
     if (myTableSize <= 0)
         return -1;
@@ -456,13 +490,69 @@ static int store_with_linear_probing(int startPos, const char *csvLine)
                 return -1;
             }
 
+            myTableEventIDs[pos] = eventID;
             myCount++;
+
             return pos; // Return the actual slot used.
         }
     }
 
     fprintf(stderr, "Peer %s: hash table is full\n", peerName);
     return -1;
+}
+
+static int find_event_local(int eventID, char *result, size_t resultSize)
+{
+    if (myTableSize <= 0 || result == NULL || resultSize == 0)
+        return 0;
+
+    int startPos = eventID % myTableSize;
+
+    for (int i = 0; i < myTableSize; i++)
+    {
+        int pos = (startPos + i) % myTableSize;
+
+        // slot empty, then event not in sequence
+        if (myTable[pos] == NULL)
+            return 0;
+
+        if (myTableEventIDs[pos] == eventID)
+        {
+            snprintf(result, resultSize, "%s", myTable[pos]);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void cmd_find_event(int eventID)
+{
+    if (!dhtBuilt || dhtSize <= 0 || numDhtPeers <= 0)
+    {
+        printf("DHT is not ready.\n");
+        return;
+    }
+
+    PeerMessage pm;
+    memset(&pm, 0, sizeof(pm));
+
+    pm.type = P2P_FIND_EVENT;
+    pm.eventID = eventID;
+
+    // this peer as the requester
+    strncpy(pm.requesterIP, peerIP, sizeof(pm.requesterIP) - 1);
+    pm.requesterPort = pPort;
+
+    pm.visitedCount = 0;
+
+    // select random starting peer
+    int startID = rand() % numDhtPeers;
+
+    printf("Searching for event %d starting at peer '%s'...\n",
+           eventID, dhtPeers[startID].peer_name);
+
+    send_to_peer(&dhtPeers[startID], &pm);
 }
 
 static void handle_store(PeerMessage *m)
@@ -481,6 +571,7 @@ static void handle_store(PeerMessage *m)
         // use linear probing if the original position is occupied
         int storedPos = store_with_linear_probing(
             m->pos,
+            m->record.eventID,
             m->record.csvLine);
 
         if (storedPos < 0)
@@ -524,6 +615,27 @@ static void send_to_peer(const Tuple *t, PeerMessage *m)
         return;
 
     sendto(peerSocket, m, sizeof(*m), 0,
+           (struct sockaddr *)&addr, sizeof(addr));
+}
+
+static void send_find_result(PeerMessage *pm)
+{
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(pm->requesterPort);
+
+    if (inet_pton(AF_INET, pm->requesterIP,
+                  &addr.sin_addr) <= 0)
+    {
+        perror("Invalid requester IP");
+        return;
+    }
+
+    pm->type = P2P_FIND_RESULT;
+
+    sendto(peerSocket, pm, sizeof(*pm), 0,
            (struct sockaddr *)&addr, sizeof(addr));
 }
 
@@ -634,7 +746,7 @@ static void populate_dht(int year, int n)
         if (id == peerID)
         {
             // store locally, resolve collision w linear probing.
-            int storedPos = store_with_linear_probing(pos, line);
+            int storedPos = store_with_linear_probing(pos, event_id, line);
 
             if (storedPos >= 0)
             {
@@ -750,6 +862,125 @@ static void cmd_query_dht(const char *line)
     printf("Starting peer: %s\n", msg.tuples[0].peer_name);
     printf("IP address:   %s\n", msg.tuples[0].ip);
     printf("P2P port:     %d\n", msg.tuples[0].p_port);
+}
+
+static void handle_find_event(PeerMessage *pm)
+{
+    // Record peer as visited.
+    int alreadyVisited = 0;
+
+    for (int i = 0; i < pm->visitedCount; i++)
+    {
+        if (pm->visited[i] == peerID)
+        {
+            alreadyVisited = 1;
+            break;
+        }
+    }
+
+    if (alreadyVisited)
+    {
+        printf("Peer %s: event %d request already visited this peer; ignoring\n",
+               peerName, pm->eventID);
+        return;
+    }
+
+    if (pm->visitedCount >= MAX_PEERS)
+    {
+        printf("Peer %s: visited list is full; stopping search for event %d\n",
+               peerName, pm->eventID);
+        return;
+    }
+
+    pm->visited[pm->visitedCount++] = peerID;
+
+    printf("Peer %s: searching for event %d (visited %d/%d)\n",
+           peerName, pm->eventID, pm->visitedCount, dhtSize);
+
+    // Search this peer's local hash table.
+    char result[MAX_RECORD_LEN];
+
+    if (find_event_local(pm->eventID, result, sizeof(result)))
+    {
+        printf("Peer %s: FOUND event %d; returning result to %s:%d\n",
+               peerName, pm->eventID,
+               pm->requesterIP, pm->requesterPort);
+
+        pm->found = 1;
+        pm->record.eventID = pm->eventID;
+
+        snprintf(pm->record.csvLine,
+                 sizeof(pm->record.csvLine),
+                 "%s", result);
+
+        send_find_result(pm);
+        return;
+    }
+
+    printf("Peer %s: event %d not in local table\n",
+           peerName, pm->eventID);
+
+    // Select a random unvisited peer.
+    int candidates[MAX_PEERS];
+    int candidateCount = 0;
+
+    for (int i = 0; i < numDhtPeers; i++)
+    {
+        int visited = 0;
+
+        for (int j = 0; j < pm->visitedCount; j++)
+        {
+            if (pm->visited[j] == i)
+            {
+                visited = 1;
+                break;
+            }
+        }
+
+        if (!visited)
+            candidates[candidateCount++] = i;
+    }
+
+    // Every peer has been searched.
+    if (candidateCount == 0)
+    {
+        printf("Peer %s: all peers searched; event %d not found\n",
+               peerName, pm->eventID);
+
+        pm->found = 0;
+        send_find_result(pm);
+        return;
+    }
+
+    int nextID = candidates[rand() % candidateCount];
+
+    printf("Peer %s: forwarding event %d to peer %s (ID %d)\n",
+           peerName, pm->eventID,
+           dhtPeers[nextID].peer_name, nextID);
+
+    // Forward search to the selected peer.
+    send_to_peer(&dhtPeers[nextID], pm);
+}
+
+static void handle_find_result(PeerMessage *pm)
+{
+    printf("Peer %s: received search result (found=%d)\n",
+           peerName, pm->found);
+
+    if (pm->found)
+    {
+        printf("\nEvent %d found:\n%s\n",
+               pm->eventID,
+               pm->record.csvLine);
+    }
+    else
+    {
+        printf("\nEvent %d was not found in the DHT.\n",
+               pm->eventID);
+    }
+
+    printf("peer> ");
+    fflush(stdout);
 }
 
 // function to find events (to test that my dht is working)

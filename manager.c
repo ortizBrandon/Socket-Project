@@ -288,7 +288,6 @@ static void setupDht(Message *msg, struct sockaddr_in *peerAddress, socklen_t pe
     dht_Leader[MAX_NAME_LEN - 1] = '\0';
 
     // log and reply
-    //  --- 7. Log and reply SUCCESS ---
     printf("Manager: setup-dht SUCCESS, n=%i year=%i leader='%s'\n",
            msg->n, msg->year, dht_Leader);
     for (int k = 0; k < count; k++)
