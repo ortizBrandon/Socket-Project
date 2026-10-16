@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <arpa/inet.h>
 #include "protocol.h"
+#include <time.h>
 
 int dht_exists = 0;                 // 0 does not exist, 1 does exist
 int dht_built = 0;                  // 1 after it is built
@@ -29,6 +30,7 @@ int numPeers = 0;      // as of the beginning we have 0 peers
 static void registerPeer(Message *msg, struct sockaddr_in *peerAddress, socklen_t peerLength, int socketName);
 static void setupDht(Message *msg, struct sockaddr_in *peerAddress, socklen_t peerLength, int socketName);
 static void dhtComplete(Message *msg, struct sockaddr_in *peerAddress, socklen_t peerLength, int socketName);
+static void queryDht(Message *msg, struct sockaddr_in *peerAddress, socklen_t peerLength, int socketName);
 
 // command line input, taking a string input as the second argument
 int main(int argc, char *argv[])
@@ -72,6 +74,8 @@ int main(int argc, char *argv[])
     struct sockaddr_in peerAddr;
     socklen_t peerlen;
 
+    srand((unsigned int)time(NULL)); // random num generator
+
     while (1)
     {
         peerlen = sizeof(peerAddr);
@@ -98,6 +102,9 @@ int main(int argc, char *argv[])
             break;
         case MSG_DHT_COMPLETE:
             dhtComplete(&msg, &peerAddr, peerlen, managerSocket);
+            break;
+        case MSG_QUERY_DHT:
+            queryDht(&msg, &peerAddr, peerlen, managerSocket);
             break;
         default:
             printf("Manager:   unknown type %i\n", msg.type);
@@ -315,4 +322,108 @@ static void dhtComplete(Message *msg, struct sockaddr_in *peerAddress, socklen_t
 
     reply.return_code = RC_SUCCESS;
     sendto(socketName, &reply, sizeof(reply), 0, (struct sockaddr *)peerAddress, peerLength);
+}
+
+static void queryDht(Message *msg, struct sockaddr_in *peerAddress, socklen_t peerLength, int socketName)
+{
+    Message reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.type = MSG_QUERY_DHT;
+
+    // dht must exist and be constructed
+    if (!dht_exists || !dht_built)
+    {
+        printf("Manager: query-dht FAILED, DHT is not built\n");
+        reply.return_code = RC_FAILURE;
+
+        sendto(socketName, &reply, sizeof(reply), 0,
+               (struct sockaddr *)peerAddress, peerLength);
+        return;
+    }
+
+    // find the requested peer
+    int requesterIndex = -1;
+
+    for (int i = 0; i < numPeers; i++)
+    {
+        if (strcmp(peers[i].name, msg->peer_name) == 0)
+        {
+            requesterIndex = i;
+            break;
+        }
+    }
+
+    if (requesterIndex < 0)
+    {
+        printf("Manager: query-dht FAILED, peer '%s' not registered\n",
+               msg->peer_name);
+
+        reply.return_code = RC_FAILURE;
+
+        sendto(socketName, &reply, sizeof(reply), 0,
+               (struct sockaddr *)peerAddress, peerLength);
+        return;
+    }
+
+    // only a free peer can initiate a query
+    if (peers[requesterIndex].state != STATE_FREE)
+    {
+        printf("Manager: query-dht FAILED, peer '%s' is not Free\n",
+               msg->peer_name);
+
+        reply.return_code = RC_FAILURE;
+
+        sendto(socketName, &reply, sizeof(reply), 0,
+               (struct sockaddr *)peerAddress, peerLength);
+        return;
+    }
+
+    // collect peers maintaining dht
+    int members[MAX_PEERS];
+    int memberCount = 0;
+
+    for (int i = 0; i < numPeers; i++)
+    {
+        if (peers[i].state == STATE_LEADER ||
+            peers[i].state == STATE_INDHT)
+        {
+            members[memberCount++] = i;
+        }
+    }
+
+    if (memberCount == 0)
+    {
+        printf("Manager: query-dht FAILED, no DHT members found\n");
+
+        reply.return_code = RC_FAILURE;
+
+        sendto(socketName, &reply, sizeof(reply), 0,
+               (struct sockaddr *)peerAddress, peerLength);
+        return;
+    }
+
+    // random selection of member
+    int selectedIndex = members[rand() % memberCount];
+    Peer *selected = &peers[selectedIndex];
+
+    strncpy(reply.tuples[0].peer_name,
+            selected->name, MAX_NAME_LEN - 1);
+    reply.tuples[0].peer_name[MAX_NAME_LEN - 1] = '\0';
+
+    strncpy(reply.tuples[0].ip,
+            selected->ip, INET_ADDRSTRLEN - 1);
+    reply.tuples[0].ip[INET_ADDRSTRLEN - 1] = '\0';
+
+    reply.tuples[0].p_port = selected->p_port;
+    reply.tuple_count = 1;
+    reply.return_code = RC_SUCCESS;
+
+    printf("Manager: query-dht SUCCESS for '%s'\n",
+           msg->peer_name);
+    printf("Manager:   selected starting peer '%s' at %s:%d\n",
+           selected->name, selected->ip, selected->p_port);
+
+    // return peers tuple
+    sendto(socketName, &reply, sizeof(reply), 0,
+           (struct sockaddr *)peerAddress, peerLength);
 }

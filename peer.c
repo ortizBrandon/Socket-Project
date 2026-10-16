@@ -71,6 +71,11 @@ static int count_csv_lines(int year);
 static void populate_dht(int year, int n);
 static void send_dht_complete(void);
 static void print_config(void);
+static int store_with_linear_probing(int startPos, const char *csvLine);
+static void cmd_query_dht(const char *line);
+
+static int get_event_id_from_csv(const char *line);
+static void cmd_find_local_event(int eventID);
 
 int main(int argc, char *argv[])
 {
@@ -140,9 +145,26 @@ int main(int argc, char *argv[])
             {
                 cmd_setup_dht(command);
             }
+            else if (strncmp(command, "query-dht", 9) == 0)
+            {
+                cmd_query_dht(command);
+            }
             else if (strcmp(command, "config") == 0)
             {
                 print_config();
+            }
+            else if (strncmp(command, "find-local ", 11) == 0)
+            {
+                int eventID;
+
+                if (sscanf(command + 11, "%d", &eventID) == 1)
+                {
+                    cmd_find_local_event(eventID);
+                }
+                else
+                {
+                    printf("Usage: find-local <EVENT_ID>\n");
+                }
             }
             else if (strcmp(command, "quit") == 0)
             {
@@ -414,43 +436,82 @@ static void handle_set_id(PeerMessage *m)
            peerID, dhtSize, rightNeighbor.peer_name);
 }
 
+static int store_with_linear_probing(int startPos, const char *csvLine)
+{
+    if (myTableSize <= 0)
+        return -1;
+
+    // Start at the original hash position.
+    for (int i = 0; i < myTableSize; i++)
+    {
+        int pos = (startPos + i) % myTableSize;
+
+        if (myTable[pos] == NULL)
+        {
+            myTable[pos] = strdup(csvLine);
+
+            if (myTable[pos] == NULL)
+            {
+                perror("strdup");
+                return -1;
+            }
+
+            myCount++;
+            return pos; // Return the actual slot used.
+        }
+    }
+
+    fprintf(stderr, "Peer %s: hash table is full\n", peerName);
+    return -1;
+}
+
 static void handle_store(PeerMessage *m)
 {
+    if (dhtSize <= 0 || myTableSize <= 0)
+    {
+        return;
+    }
+
+    // determine which peer is responsible for this record
     int id = m->pos % dhtSize;
 
     if (id == peerID)
     {
-        if (m->pos >= 0 && m->pos < myTableSize)
-        {
-            // only store if current slot is empty
-            if (myTable[m->pos] == NULL)
-            {
-                myTable[m->pos] = strdup(m->record.csvLine);
+        // This peer is responsible for storing the record.
+        // use linear probing if the original position is occupied
+        int storedPos = store_with_linear_probing(
+            m->pos,
+            m->record.csvLine);
 
-                if (myTable[m->pos] == NULL)
-                {
-                    perror("strdup");
-                    return;
-                }
-            }
-            myCount++;
+        if (storedPos < 0)
+        {
+            fprintf(stderr,
+                    "Peer %s: failed to store event %d\n",
+                    peerName,
+                    m->record.eventID);
         }
     }
     else if (haveRightNeighbor)
     {
+        // forward until reaches right peer
         send_to_peer(&rightNeighbor, m);
     }
 }
 
 static void handle_done(PeerMessage *m)
 {
+    dhtBuilt = 1;
+
     if (m->doneCount < MAX_PEERS)
     {
         m->counts[m->doneCount] = myCount;
         m->doneCount++;
     }
+
     if (haveRightNeighbor)
+    {
         send_to_peer(&rightNeighbor, m);
+    }
 }
 
 static void send_to_peer(const Tuple *t, PeerMessage *m)
@@ -534,64 +595,81 @@ static void populate_dht(int year, int n)
     }
 
     char line[4096];
+
+    // Skip CSV header.
     if (!fgets(line, sizeof(line), f))
     {
         fclose(f);
         return;
-    } // skip header
+    }
 
-    int ell = 0, sent = 0, local = 0;
+    int ell = 0, sent = 0, local = 0, collisions = 0;
 
     while (fgets(line, sizeof(line), f))
     {
-        // if trailing newline, remove
+        // Remove trailing newline.
         line[strcspn(line, "\r\n")] = '\0';
 
-        // extract eventID from first csv field
-        char *comma = strchr(line, ',');
-        if (comma == NULL)
+        // Extract EVENT_ID, the eighth CSV field.
+        char *field = line;
+
+        for (int i = 0; i < 7; i++)
+        {
+            field = strchr(field, ',');
+            if (field == NULL)
+                break;
+
+            field++;
+        }
+
+        if (field == NULL)
             continue;
 
-        int event_id = atoi(line);
+        int event_id = atoi(field);
 
+        // hash function
         int pos = event_id % myTableSize;
         int id = pos % n;
 
         if (id == peerID)
         {
-            if (myTable[pos] == NULL)
+            // store locally, resolve collision w linear probing.
+            int storedPos = store_with_linear_probing(pos, line);
+
+            if (storedPos >= 0)
             {
-                myTable[pos] = strdup(line);
-
-                if (myTable[pos] == NULL)
-                {
-                    perror("strdup");
-                    continue;
-                }
-
-                myCount++;
                 local++;
+            }
+            else
+            {
+                collisions++;
             }
         }
         else
         {
+            // Send to the right neighbor; records travel around the ring.
             PeerMessage pm;
             memset(&pm, 0, sizeof(pm));
+
             pm.type = P2P_STORE;
-            pm.pos = pos;
+            pm.pos = pos; // Preserve the original hash position.
             pm.record.eventID = event_id;
 
-            strncpy(pm.record.csvLine, line, sizeof(pm.record.csvLine) - 1);
+            strncpy(pm.record.csvLine, line,
+                    sizeof(pm.record.csvLine) - 1);
 
             send_to_peer(&rightNeighbor, &pm);
             sent++;
         }
+
         ell++;
     }
 
     fclose(f);
-    printf("Peer: leader stored %d locally, sent %d around ring (total %d)\n",
-           local, sent, ell);
+
+    printf("Peer: leader stored %d locally, sent %d around ring, "
+           "failed local stores %d (total rows %d)\n",
+           local, sent, collisions, ell);
 }
 
 static void send_dht_complete(void)
@@ -631,4 +709,96 @@ static void print_config(void)
                i, dhtPeers[i].peer_name, dhtPeers[i].ip, dhtPeers[i].p_port);
     }
     printf("======================\n");
+}
+
+static void cmd_query_dht(const char *line)
+{
+    char command[32];
+    char requesterName[MAX_NAME_LEN];
+
+    // parse
+    if (sscanf(line, "%31s %15s", command, requesterName) != 2)
+    {
+        printf("Usage: query-dht <peer-name>\n");
+        return;
+    }
+
+    // prep manager request
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+
+    msg.type = MSG_QUERY_DHT;
+    strncpy(msg.peer_name, requesterName, MAX_NAME_LEN - 1);
+    msg.peer_name[MAX_NAME_LEN - 1] = '\0';
+
+    // send request and wait for manager
+    send_to_manager(&msg);
+
+    if (msg.return_code != RC_SUCCESS)
+    {
+        printf("query-dht FAILED\n");
+        return;
+    }
+
+    if (msg.tuple_count < 1)
+    {
+        printf("query-dht FAILED: manager returned no DHT peer\n");
+        return;
+    }
+
+    printf("query-dht SUCCESS\n");
+    printf("Starting peer: %s\n", msg.tuples[0].peer_name);
+    printf("IP address:   %s\n", msg.tuples[0].ip);
+    printf("P2P port:     %d\n", msg.tuples[0].p_port);
+}
+
+// function to find events (to test that my dht is working)
+
+static int get_event_id_from_csv(const char *line)
+{
+    if (line == NULL)
+        return -1;
+
+    const char *field = line;
+
+    for (int i = 0; i < 7; i++)
+    {
+        field = strchr(field, ',');
+
+        if (field == NULL)
+            return -1;
+
+        field++;
+    }
+
+    return atoi(field);
+}
+
+static void cmd_find_local_event(int eventID)
+{
+    if (!dhtBuilt)
+    {
+        printf("DHT has not been marked complete yet.\n");
+        return;
+    }
+
+    for (int i = 0; i < myTableSize; i++)
+    {
+        if (myTable[i] == NULL)
+            continue;
+
+        int storedID = get_event_id_from_csv(myTable[i]);
+
+        if (storedID == eventID)
+        {
+            printf("Event %d found on peer '%s' (ID %d)\n",
+                   eventID, peerName, peerID);
+            printf("Hash table position: %d\n", i);
+            printf("CSV record:\n%s\n", myTable[i]);
+            return;
+        }
+    }
+
+    printf("Event %d not found on peer '%s' (ID %d).\n",
+           eventID, peerName, peerID);
 }

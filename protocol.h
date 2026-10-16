@@ -15,6 +15,7 @@
 #define MSG_REGISTER 1
 #define MSG_SETUP_DHT 2
 #define MSG_DHT_COMPLETE 3
+#define MSG_QUERY_DHT 4
 
 // ---- Return codes ----
 #define RC_SUCCESS 0
