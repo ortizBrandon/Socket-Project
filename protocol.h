@@ -17,6 +17,13 @@
 #define MSG_DHT_COMPLETE 3
 #define MSG_QUERY_DHT 4
 
+#define MSG_LEAVE_DHT 5
+#define MSG_JOIN_DHT 6
+#define MSG_DHT_REBUILT 7
+#define MSG_DEREGISTER 8
+#define MSG_TEARDOWN_DHT 9
+#define MSG_TEARDOWN_COMPLETE 10
+
 // ---- Return codes ----
 #define RC_SUCCESS 0
 #define RC_FAILURE 1
@@ -63,6 +70,9 @@ typedef struct
 
     int tuple_count;
     Tuple tuples[MAX_PEERS];
+
+    //assigns new leader if the current one leaves
+    char new_leader[MAX_NAME_LEN];
 
 } Message;
 
